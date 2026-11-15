@@ -1,4 +1,7 @@
-# ⚡ raft-nexus
+# Raft-Nexus | Rust Distributed Consensus, Multi-Raft Replication & Key-Value Store
+
+Raft-Nexus is a Rust distributed-systems project exploring replicated state machines and fault-tolerant key-value storage with Raft-style consensus. The repository documents multi-group replication, quorum-based operations, durable write-ahead logging, linearizable reads, and transaction coordination. It is relevant to engineers studying distributed consensus, replication, and storage-engine architecture; consult the benchmark setup before comparing performance.
+
 
 <div align="center">
 
