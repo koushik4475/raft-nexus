@@ -101,6 +101,10 @@ impl Transport for ChannelTransport {
     }
 }
 
+/// Maximum serialized Raft message size accepted by the TCP framing codec (16 MiB).
+/// Reject oversized frames before allocating their advertised payload length.
+const MAX_FRAME_SIZE: usize = 16 * 1024 * 1024;
+
 /// TCP Framing utility for wire encoding / decoding.
 pub struct TcpCodec;
 
@@ -111,6 +115,12 @@ impl TcpCodec {
         msg: &RaftMessage,
     ) -> Result<(), TransportError> {
         let bytes = serde_json::to_vec(msg)?;
+        if bytes.len() > MAX_FRAME_SIZE {
+            return Err(TransportError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("Raft frame exceeds maximum size of {} bytes", MAX_FRAME_SIZE),
+            )));
+        }
         let len = (bytes.len() as u32).to_be_bytes();
         writer.write_all(&len).await?;
         writer.write_all(&bytes).await?;
@@ -125,10 +135,39 @@ impl TcpCodec {
         let mut len_buf = [0u8; 4];
         reader.read_exact(&mut len_buf).await?;
         let len = u32::from_be_bytes(len_buf) as usize;
+        if len > MAX_FRAME_SIZE {
+            return Err(TransportError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("Raft frame exceeds maximum size of {} bytes", MAX_FRAME_SIZE),
+            )));
+        }
 
         let mut data = vec![0u8; len];
         reader.read_exact(&mut data).await?;
         let msg = serde_json::from_slice(&data)?;
         Ok(msg)
+    }
+}
+
+#[cfg(test)]
+mod tcp_codec_tests {
+    use super::*;
+    use tokio::io::AsyncWriteExt;
+
+    #[tokio::test]
+    async fn rejects_oversized_frame_before_reading_payload() {
+        let (mut writer, mut reader) = tokio::io::duplex(4);
+        writer
+            .write_all(&((MAX_FRAME_SIZE as u32) + 1).to_be_bytes())
+            .await
+            .unwrap();
+
+        let error = TcpCodec::read_message(&mut reader).await.unwrap_err();
+        match error {
+            TransportError::Io(error) => {
+                assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+            }
+            other => panic!("expected invalid-data error, got {other:?}"),
+        }
     }
 }
