@@ -8,6 +8,10 @@ use tokio::sync::mpsc;
 
 use crate::rpc::protocol::RaftMessage;
 
+/// Maximum accepted serialized Raft message size (16 MiB).
+/// Reject oversized frames before allocating their payload buffer.
+const MAX_FRAME_SIZE: usize = 16 * 1024 * 1024;
+
 #[derive(Debug, Error)]
 pub enum TransportError {
     #[error("Node {0} is currently unreachable or partitioned")]
@@ -18,6 +22,8 @@ pub enum TransportError {
     Serialization(#[from] serde_json::Error),
     #[error("Channel closed")]
     Closed,
+    #[error("Frame length {0} exceeds the maximum allowed size of {MAX_FRAME_SIZE} bytes")]
+    FrameTooLarge(usize),
 }
 
 #[async_trait]
@@ -125,10 +131,53 @@ impl TcpCodec {
         let mut len_buf = [0u8; 4];
         reader.read_exact(&mut len_buf).await?;
         let len = u32::from_be_bytes(len_buf) as usize;
+        if len > MAX_FRAME_SIZE {
+            return Err(TransportError::FrameTooLarge(len));
+        }
 
         let mut data = vec![0u8; len];
         reader.read_exact(&mut data).await?;
         let msg = serde_json::from_slice(&data)?;
         Ok(msg)
+    }
+}
+
+
+#[cfg(test)]
+mod tcp_codec_tests {
+    use super::*;
+    use tokio::io::{duplex, AsyncWriteExt};
+
+    #[tokio::test]
+    async fn rejects_oversized_frame_before_reading_payload() {
+        let (mut writer, mut reader) = duplex(8);
+        writer.write_all(&((MAX_FRAME_SIZE as u32) + 1).to_be_bytes()).await.unwrap();
+
+        let result = TcpCodec::read_message(&mut reader).await;
+        assert!(matches!(result, Err(TransportError::FrameTooLarge(size)) if size == MAX_FRAME_SIZE + 1));
+    }
+
+    #[tokio::test]
+    async fn accepts_frame_at_maximum_size() {
+        let (mut writer, mut reader) = duplex(MAX_FRAME_SIZE + 4);
+        let payload = serde_json::to_vec(&RaftMessage {
+            group_id: 1,
+            from: 1,
+            to: 2,
+            payload: crate::rpc::protocol::RaftPayload::RequestVote(
+                crate::rpc::protocol::RequestVoteArgs {
+                    term: 1,
+                    candidate_id: 1,
+                    last_log_index: 0,
+                    last_log_term: 0,
+                },
+            ),
+        }).unwrap();
+        assert!(payload.len() <= MAX_FRAME_SIZE);
+        writer.write_all(&(payload.len() as u32).to_be_bytes()).await.unwrap();
+        writer.write_all(&payload).await.unwrap();
+
+        let decoded = TcpCodec::read_message(&mut reader).await.unwrap();
+        assert_eq!(decoded.group_id, 1);
     }
 }
